@@ -1,0 +1,158 @@
+name: Build FFmpeg for Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      library_set:
+        description: "Set of enabled external libraries"
+        required: true
+        type: choice
+        default: "all-free"
+        options:
+          - "all-free"
+          - "all-free-gpl"
+          - "none"
+      abis:
+        description: "The ABI being built (comma-separated, leave blank for all)"
+        required: false
+        type: string
+        default: "armeabi-v7a,arm64-v8a,x86,x86_64"
+      android_api_level:
+        description: "Android API level"
+        required: true
+        type: string
+        default: "24"
+      ffmpeg_version:
+        description: "The version of FFmpeg tag downloaded as tar (e.g. 8.1.2)"
+        required: false
+        type: string
+        default: ""
+      create_release:
+        description: "Create GitHub Release after successful build?"
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      abis: ${{ steps.set-matrix.outputs.abis }}
+    steps:
+      - id: set-matrix
+        run: |
+          ABIS_INPUT="${{ inputs.abis }}"
+          if [ -z "$ABIS_INPUT" ]; then
+            ABIS_INPUT="armeabi-v7a,arm64-v8a,x86,x86_64"
+          fi
+          JSON=$(python3 -c "import json,sys; print(json.dumps([a.strip() for a in '$ABIS_INPUT'.split(',') if a.strip()]))")
+          echo "abis=$JSON" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        abi: ${{ fromJson(needs.prepare.outputs.abis) }}
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson nasm ninja-build
+
+      - name: Build library flags
+        id: flags
+        run: |
+          case "${{ inputs.library_set }}" in
+            all-free)
+              echo "flags=-all-free" >> "$GITHUB_OUTPUT"
+              ;;
+            all-free-gpl)
+              echo "flags=-all-free -all-gpl" >> "$GITHUB_OUTPUT"
+              ;;
+            none)
+              echo "flags=" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Run ffmpeg-android-maker
+        run: |
+          export ANDROID_SDK_HOME=$ANDROID_HOME
+          export ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME
+
+          SOURCE_FLAG=""
+          if [ -n "${{ inputs.ffmpeg_version }}" ]; then
+            SOURCE_FLAG="--source-tar=${{ inputs.ffmpeg_version }}"
+          fi
+
+          ./ffmpeg-android-maker.sh \
+            ${{ steps.flags.outputs.flags }} \
+            -android=${{ inputs.android_api_level }} \
+            -abis=${{ matrix.abi }} \
+            $SOURCE_FLAG
+
+      - name: Upload per-ABI output
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-android-output-${{ matrix.abi }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload stats
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-android-stats-${{ matrix.abi }}
+          path: stats/
+          retention-days: 14
+
+  merge:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all per-ABI outputs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ffmpeg-android-output-*
+          path: merged-output-raw
+
+      - name: Merge into single output tree
+        run: |
+          mkdir -p merged-output
+          for d in merged-output-raw/*/; do
+            cp -r "${d}"* merged-output/
+          done
+          find merged-output -maxdepth 3
+
+      - name: Zip merged output
+        run: |
+          cd merged-output
+          zip -r ../ffmpeg-android-output.zip .
+
+      - name: Upload merged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-android-output-all-abis
+          path: ffmpeg-android-output.zip
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release == 'true' || inputs.create_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ffmpeg-android-${{ github.run_number }}
+          name: "FFmpeg Android build #${{ github.run_number }}"
+          body: |
+            Build otomatis via workflow_dispatch.
+
+            - Library set: `${{ inputs.library_set }}`
+            - ABIs: `${{ inputs.abis }}`
+            - Android API level: `${{ inputs.android_api_level }}`
+            - FFmpeg source: `${{ inputs.ffmpeg_version || 'default (see script)' }}`
+          files: ffmpeg-android-output.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
